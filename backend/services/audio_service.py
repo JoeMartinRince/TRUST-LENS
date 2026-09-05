@@ -1,24 +1,41 @@
-import io
 import os
+import logging
 import tempfile
 import numpy as np
 from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
+
+# ── Service Constants ────────────────────────────────────────────────────────
+DEFAULT_SPECTRAL_FLATNESS: float = 0.042
+DEFAULT_PITCH_VARIANCE: float = 185.0
+DEFAULT_HNR_DB: float = 14.2
+
+SPECTRAL_FLATNESS_THRESHOLD: float = 0.07
+PITCH_VARIANCE_THRESHOLD: float = 140.0
+HNR_THRESHOLD_DB: float = 24.0
+
 
 def analyze_audio_file(audio_bytes: bytes, filename: str = "audio.wav") -> Dict[str, Any]:
     """
     Extracts spectral_flatness, pitch_variance, and harmonic_to_noise_ratio using librosa.
     Flags suspicious TTS / synthetic voice clone patterns.
+
+    Args:
+        audio_bytes (bytes): Raw binary bytes of audio file.
+        filename (str): Name of uploaded audio file.
+
     Returns:
-      {
-        "spectral_flatness": float,
-        "pitch_variance": float,
-        "harmonic_to_noise_ratio": float,
-        "suspicious_flags": List[str]
-      }
+        Dict[str, Any]: {
+            "spectral_flatness": float,
+            "pitch_variance": float,
+            "harmonic_to_noise_ratio": float,
+            "suspicious_flags": List[str]
+        }
     """
-    spectral_flatness_val = 0.042
-    pitch_variance_val = 185.0
-    hnr_val = 14.2
+    spectral_flatness_val = DEFAULT_SPECTRAL_FLATNESS
+    pitch_variance_val = DEFAULT_PITCH_VARIANCE
+    hnr_val = DEFAULT_HNR_DB
     suspicious_flags: List[str] = []
 
     if not audio_bytes:
@@ -63,18 +80,17 @@ def analyze_audio_file(audio_bytes: bytes, filename: str = "audio.wav") -> Dict[
             hnr_val = float(10 * np.log10(harm_power / noise_power))
 
             # Suspiciousness detection heuristics for TTS / Voice Clones
-            if spectral_flatness_val > 0.07:
+            if spectral_flatness_val > SPECTRAL_FLATNESS_THRESHOLD:
                 suspicious_flags.append(f"Unusually high spectral flatness ({spectral_flatness_val:.3f}) — common in neural vocoders and TTS output")
 
-            if pitch_variance_val < 140.0 and len(y) > sr:
+            if pitch_variance_val < PITCH_VARIANCE_THRESHOLD and len(y) > sr:
                 suspicious_flags.append(f"Unnaturally low pitch variance ({pitch_variance_val:.1f}) — flat robotic prosody signature")
 
-            if hnr_val > 24.0:
+            if hnr_val > HNR_THRESHOLD_DB:
                 suspicious_flags.append(f"Elevated harmonic purity ratio ({hnr_val:.1f} dB) — artifact of synthetic neural speech filtering")
 
     except Exception as err:
-        print("Librosa processing warning:", err)
-        # Safe fallback if format decoder fails
+        logger.warning(f"Librosa processing warning: {err}")
         spectral_flatness_val = 0.045
         pitch_variance_val = 135.0
         hnr_val = 16.0

@@ -8,30 +8,38 @@ from typing import Dict, Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-_CV2_AVAILABLE = False
+# ── Service Constants ────────────────────────────────────────────────────────
+TARGET_KEYFRAMES: int = 5
+AI_FLAG_THRESHOLD: float = 70.0
+JPEG_QUALITY: int = 95
+ASYNC_HTTP_TIMEOUT_SECONDS: float = 12.0
+
+_CV2_AVAILABLE: bool = False
 try:
     import cv2
     _CV2_AVAILABLE = True
 except ImportError:
-    pass
+    logger.warning("OpenCV module 'cv2' not installed — video keyframe processing disabled.")
 
 from backend.services.ai_detector_service import run_ai_detector_async, run_ai_detector
-
-TARGET_KEYFRAMES = 5
-AI_FLAG_THRESHOLD = 70.0
 
 
 def _extract_keyframes(video_bytes: bytes) -> Tuple[List[bytes], List[str]]:
     """
-    Decode video bytes with OpenCV, sample exactly TARGET_KEYFRAMES evenly
-    spaced frames, save each keyframe to a unique file path on disk, and return
+    Decodes video bytes with OpenCV, samples exactly TARGET_KEYFRAMES evenly
+    spaced frames, saves each keyframe to a unique file path on disk, and returns
     both the frame bytes list and keyframe file paths list.
+
+    Args:
+        video_bytes (bytes): Raw binary bytes of video file.
+
+    Returns:
+        Tuple[List[bytes], List[str]]: (list_of_jpeg_bytes, list_of_saved_disk_paths)
     """
     if not _CV2_AVAILABLE:
         logger.warning("Video keyframe extraction unavailable: cv2 module not installed")
         return [], []
 
-    tmp_path = None
     cap = None
     try:
         suffix = ".mp4"
@@ -59,7 +67,6 @@ def _extract_keyframes(video_bytes: bytes) -> Tuple[List[bytes], List[str]]:
 
         duration_sec = total_frames / fps
         logger.info(f"Video loaded from {tmp_path}: total_frames={total_frames}, fps={fps:.2f}, duration={duration_sec:.2f}s")
-        print(f"[Video Extractor] Video source file path: {tmp_path}")
 
         if duration_sec <= 0.5 or TARGET_KEYFRAMES == 1:
             timestamps = [0.0]
@@ -76,7 +83,7 @@ def _extract_keyframes(video_bytes: bytes) -> Tuple[List[bytes], List[str]]:
             if not ret or frame is None:
                 logger.warning(f"Keyframe {idx+1} read failed at timestamp {ts:.2f}s")
                 continue
-            success, buf_out = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            success, buf_out = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             if success:
                 frame_b = bytes(buf_out)
                 kf_filename = f"keyframe_{idx+1}_ts{ts:.2f}s_{uuid.uuid4().hex[:6]}.jpg"
@@ -87,14 +94,11 @@ def _extract_keyframes(video_bytes: bytes) -> Tuple[List[bytes], List[str]]:
                 frames.append(frame_b)
                 frame_paths.append(kf_path)
                 logger.info(f"Saved keyframe {idx+1}/{len(timestamps)} to disk: {kf_path} ({len(frame_b)} bytes)")
-                print(f"[Video Extractor] Keyframe {idx+1} file path on disk: {kf_path}")
 
         return frames, frame_paths
 
     except Exception as e:
-        msg = f"Video keyframe extraction error: {e}"
-        logger.error(msg)
-        print(msg)
+        logger.error(f"Video keyframe extraction error: {e}")
         return [], []
     finally:
         if cap is not None:
@@ -108,7 +112,13 @@ async def run_video_ai_detector_async(video_bytes: bytes) -> Dict[str, Any]:
     """
     Extracts keyframes from a video and runs Hugging Face AI detector calls CONCURRENTLY
     across all keyframes using asyncio.gather and httpx connection pooling.
-    This eliminates sequential latency (e.g. 5x sequential delays -> 1x parallel delay).
+
+    Args:
+        video_bytes (bytes): Raw binary bytes of uploaded video file.
+
+    Returns:
+        Dict[str, Any]: Video keyframe detector results containing max confidence,
+                        per-frame breakdown, keyframe paths, and flagged count.
     """
     if not _CV2_AVAILABLE or not video_bytes:
         return {
@@ -132,10 +142,9 @@ async def run_video_ai_detector_async(video_bytes: bytes) -> Dict[str, Any]:
             "note": "Video AI detector unavailable (keyframe extraction failed)"
         }
 
-    print(f"\n================ VIDEO CONCURRENT PER-FRAME DETECTOR RUN ================")
-    print(f"Total keyframes extracted: {len(frames)}. Executing parallel asyncio requests...")
+    logger.info(f"Video Keyframe Detector: Extracted {len(frames)} keyframes. Executing concurrent AI detector requests...")
 
-    async with httpx.AsyncClient(timeout=12.0) as async_client:
+    async with httpx.AsyncClient(timeout=ASYNC_HTTP_TIMEOUT_SECONDS) as async_client:
         tasks = [
             run_ai_detector_async(frame_bytes, log_prefix=f" [frame {i+1}/{len(frames)}]", client=async_client)
             for i, frame_bytes in enumerate(frames)
@@ -152,7 +161,7 @@ async def run_video_ai_detector_async(video_bytes: bytes) -> Dict[str, Any]:
         if isinstance(result, Exception):
             exc_msg = f"{type(result).__name__}: {result}"
             frame_status["error"] = exc_msg
-            print(f"  Frame {idx+1} Result: EXCEPTION | error = {exc_msg}")
+            logger.error(f"  Frame {idx+1} Result: EXCEPTION | error = {exc_msg}")
         elif isinstance(result, dict):
             conf = result.get("ai_generation_confidence")
             if conf is not None:
@@ -163,15 +172,13 @@ async def run_video_ai_detector_async(video_bytes: bytes) -> Dict[str, Any]:
                 frame_status["status"] = "success"
                 frame_status["confidence"] = conf_val
                 frame_status["model_used"] = result.get("model_used")
-                print(f"  Frame {idx+1} Result: SUCCESS | raw ai_generation_confidence = {conf_val}%")
+                logger.info(f"  Frame {idx+1} Result: SUCCESS | raw ai_generation_confidence = {conf_val}%")
             else:
                 note_reason = result.get("note", "unparseable/unmatched labels")
                 frame_status["error"] = note_reason
-                print(f"  Frame {idx+1} Result: FAILED/NULL | note = {note_reason}")
+                logger.warning(f"  Frame {idx+1} Result: FAILED/NULL | note = {note_reason}")
 
         per_frame_results.append(frame_status)
-
-    print("=========================================================================\n")
 
     if not confidences:
         return {
@@ -206,6 +213,12 @@ async def run_video_ai_detector_async(video_bytes: bytes) -> Dict[str, Any]:
 def run_video_ai_detector(video_bytes: bytes) -> Dict[str, Any]:
     """
     Synchronous wrapper for run_video_ai_detector_async.
+
+    Args:
+        video_bytes (bytes): Raw binary bytes of uploaded video file.
+
+    Returns:
+        Dict[str, Any]: Video keyframe detector results.
     """
     try:
         loop = asyncio.get_event_loop()

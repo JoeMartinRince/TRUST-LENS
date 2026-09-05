@@ -1,13 +1,20 @@
 import io
 import piexif
+import logging
 from PIL import Image, ExifTags
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional
 
-AI_GENERATOR_KEYWORDS = [
+logger = logging.getLogger(__name__)
+
+# ── Metadata Service Constants ───────────────────────────────────────────────
+MAX_HEADER_SAMPLE_BYTES: int = 4096
+
+AI_GENERATOR_KEYWORDS: List[str] = [
     "midjourney", "dalle", "dall-e", "stable diffusion", "firefly", 
     "gemini", "ideogram", "leonardo", "playground", "photoshop", 
     "gimp", "automatic1111", "comfyui"
 ]
+
 
 def extract_metadata(
     image_bytes: bytes, 
@@ -15,16 +22,22 @@ def extract_metadata(
     pre_decoded_image: Optional[Image.Image] = None
 ) -> Dict[str, Any]:
     """
-    Extracts real EXIF metadata from raw image bytes using Pillow and piexif.
-    Optionally accepts a pre_decoded_image PIL Image instance to avoid re-decoding.
+    Extracts EXIF metadata from raw image bytes using Pillow and piexif.
+    Optionally accepts a pre-decoded PIL Image instance to avoid redundant image decoding.
+
+    Args:
+        image_bytes (bytes): Raw binary bytes of uploaded image.
+        filename (str): Name of uploaded file.
+        pre_decoded_image (Optional[Image.Image]): Pre-decoded in-memory PIL Image instance.
+
     Returns:
-      {
-        "has_exif": bool,
-        "camera_make": str or None,
-        "software_tag": str or None,
-        "creation_date": str or None,
-        "suspicious_flags": List[str]
-      }
+        Dict[str, Any]: {
+            "has_exif": bool,
+            "camera_make": str or None,
+            "software_tag": str or None,
+            "creation_date": str or None,
+            "suspicious_flags": List[str]
+        }
     """
     has_exif = False
     camera_make: Optional[str] = None
@@ -81,8 +94,8 @@ def extract_metadata(
             )
             if date_bytes:
                 creation_date = date_bytes.decode("utf-8", errors="ignore").strip("\x00 ").strip() if isinstance(date_bytes, bytes) else str(date_bytes).strip()
-        except Exception:
-            pass
+        except Exception as err:
+            logger.warning(f"piexif tag extraction warning: {err}")
 
     # 3. Fallback to Pillow EXIF (reuse pre_decoded_image if available)
     if not camera_make or not creation_date or not software_tag:
@@ -105,8 +118,8 @@ def extract_metadata(
                             software_tag = str(value).strip()
                         elif tag_name in ("DateTimeOriginal", "DateTime") and not creation_date:
                             creation_date = str(value).strip()
-        except Exception:
-            pass
+        except Exception as err:
+            logger.warning(f"Pillow EXIF fallback warning: {err}")
 
     camera_make = camera_make if camera_make and camera_make.strip() else None
     software_tag = software_tag if software_tag and software_tag.strip() else None
@@ -115,7 +128,7 @@ def extract_metadata(
     # 4. Check for AI generator / editing software keywords
     detected_software_ai = None
     search_text = (software_tag or "").lower()
-    header_sample = (image_bytes[:4096] if image_bytes else b"").decode("latin-1", errors="ignore").lower()
+    header_sample = (image_bytes[:MAX_HEADER_SAMPLE_BYTES] if image_bytes else b"").decode("latin-1", errors="ignore").lower()
     
     for kw in AI_GENERATOR_KEYWORDS:
         if kw in search_text or kw in header_sample:

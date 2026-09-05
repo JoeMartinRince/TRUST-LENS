@@ -4,29 +4,49 @@ import uuid
 import logging
 import traceback
 import numpy as np
-from typing import Union
+from typing import Union, Dict, Any
 from PIL import Image, ImageChops, ImageEnhance
 import cv2
 
 logger = logging.getLogger(__name__)
 
+# ── ELA Service Constants ───────────────────────────────────────────────────
+DEFAULT_JPEG_QUALITY: int = 90
+DEFAULT_AMPLIFY_FACTOR: float = 15.0
+MAX_IMAGE_DIMENSION: int = 1024
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "heatmaps")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
+
 def run_ela_analysis(
     image_input: Union[bytes, Image.Image], 
-    quality: int = 90, 
-    amplify: float = 15.0,
+    quality: int = DEFAULT_JPEG_QUALITY, 
+    amplify: float = DEFAULT_AMPLIFY_FACTOR,
     base_url: str = "http://localhost:8000"
-) -> dict:
+) -> Dict[str, Any]:
     """
-    Performs Error Level Analysis (ELA):
-    Accepts either raw bytes OR a pre-decoded in-memory PIL Image object to avoid redundant image decoding.
-    1. Re-saves uploaded image as JPEG at quality=90 in memory.
-    2. Computes pixel-wise difference against original with PIL & numpy.
-    3. Amplifies difference (~15-20x) into a visible heatmap.
-    4. Saves heatmap PNG to static/heatmaps/ folder.
-    5. Computes ela_score (0-100) based on error variance and intensity.
+    Performs Error Level Analysis (ELA) on an image:
+    1. Accepts either raw bytes OR a pre-decoded in-memory PIL Image object to avoid redundant image decoding.
+    2. Re-saves uploaded image as JPEG at quality=90 in memory.
+    3. Computes pixel-wise difference against original with PIL & numpy.
+    4. Amplifies difference (~15-20x) into a visible colorized JET heatmap.
+    5. Saves heatmap PNG to static/heatmaps/ folder.
+    6. Computes ela_score (0-100) based on error variance and intensity.
+
+    Args:
+        image_input (Union[bytes, Image.Image]): Binary bytes or PIL Image instance.
+        quality (int): JPEG resave compression quality level (default 90).
+        amplify (float): Error brightness amplification factor (default 15.0).
+        base_url (str): Base server URL for constructing static image links.
+
+    Returns:
+        Dict[str, Any]: {
+            "score": int (0-100),
+            "heatmap_url": str|None,
+            "original_image_url": str|None,
+            "explanation": str
+        }
     """
     img_format = "Unknown"
     img_mode = "Unknown"
@@ -56,9 +76,8 @@ def run_ela_analysis(
         img_dimensions = f"{original.size[0]}x{original.size[1]}"
         
         # Max dimension constraint for fast processing
-        max_dim = 1024
-        if max(original.size) > max_dim:
-            original.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        if max(original.size) > MAX_IMAGE_DIMENSION:
+            original.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
 
         # 1. Save compressed version to in-memory buffer at quality=90
         buffer = io.BytesIO()
@@ -112,16 +131,13 @@ def run_ela_analysis(
 
     except Exception as e:
         err_msg = (
-            f"\n================ ELA PROCESSING EXCEPTION TRACEBACK ================\n"
+            f"ELA processing exception traceback:\n"
             f"Image Format: {img_format}\n"
             f"Image Mode: {img_mode}\n"
             f"Image Dimensions: {img_dimensions}\n"
-            f"Exception Type: {type(e).__name__}\n"
-            f"Exception Message: {e}\n"
+            f"Exception Type: {type(e).__name__}: {e}\n"
             f"Full Traceback:\n{traceback.format_exc()}"
-            f"===================================================================\n"
         )
-        print(err_msg)
         logger.error(err_msg)
 
         return {

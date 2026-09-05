@@ -1,10 +1,40 @@
 import os
 import json
+import logging
 import concurrent.futures
 import google.generativeai as genai
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-SYSTEM_INSTRUCTION_IMAGE = (
+logger = logging.getLogger(__name__)
+
+# ── Gemini Synthesis Constants ───────────────────────────────────────────────
+GEMINI_TIMEOUT_SECONDS: float = 15.0
+GEMINI_TEMPERATURE: float = 0.2
+
+EXIF_MISSING_PENALTY: int = 15
+AI_SOFTWARE_PENALTY: int = 40
+AI_FILENAME_PENALTY: int = 20
+CAMERA_NATIVE_BONUS: int = 10
+ELA_HIGH_VAR_THRESHOLD: float = 60.0
+ELA_HIGH_VAR_PENALTY: int = 25
+ELA_EXTREME_VAR_THRESHOLD: float = 80.0
+ELA_EXTREME_VAR_PENALTY: int = 40
+NO_REVERSE_SEARCH_PENALTY: int = 5
+REVERSE_SEARCH_MATCH_PENALTY: int = 30
+
+AI_DETECTOR_HIGH_CONF_THRESHOLD: float = 70.0
+AI_DETECTOR_EXTREME_CONF_THRESHOLD: float = 90.0
+AI_DETECTOR_PENALTY: int = 50
+AI_DETECTOR_EXTREME_MAX_TRUST_SCORE: int = 15
+
+GEMINI_MODELS: List[str] = [
+    "gemini-3.6-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-pro",
+]
+
+SYSTEM_INSTRUCTION_IMAGE: str = (
     "You are a media forensics analyst. You are given raw technical findings about an uploaded image. "
     "Synthesize them into a clear trust assessment for a non-technical user such as a journalist or everyday citizen. "
     "Return ONLY valid JSON with this exact schema:\n"
@@ -34,7 +64,7 @@ SYSTEM_INSTRUCTION_IMAGE = (
     "Rules: be specific, cite only given evidence, never invent findings, be honest about uncertainty, avoid absolute claims like '100% AI-generated'."
 )
 
-SYSTEM_INSTRUCTION_VIDEO = (
+SYSTEM_INSTRUCTION_VIDEO: str = (
     "You are a video forensics analyst. You are given raw technical findings about an uploaded video file. "
     "Synthesize them into a clear risk assessment for a non-technical user such as a journalist or everyday citizen. "
     "Return ONLY valid JSON with this exact schema:\n"
@@ -65,7 +95,7 @@ SYSTEM_INSTRUCTION_VIDEO = (
     "Rules: be specific, cite only given evidence, never invent findings, avoid absolute claims like '100% AI-generated'."
 )
 
-SYSTEM_INSTRUCTION_AUDIO = (
+SYSTEM_INSTRUCTION_AUDIO: str = (
     "You are an audio forensics analyst. You are given raw technical findings about an uploaded audio recording. "
     "Synthesize them into a clear trust assessment for a non-technical user such as a journalist or everyday citizen. "
     "Return ONLY valid JSON with this exact schema:\n"
@@ -89,7 +119,7 @@ SYSTEM_INSTRUCTION_AUDIO = (
     "Rules: be specific, cite only given evidence, never invent findings, be honest about uncertainty, avoid absolute claims like '100% AI-generated'."
 )
 
-SAFE_DEFAULT = {
+SAFE_DEFAULT: Dict[str, Any] = {
     "trust_score": 70,
     "verdict": "Suspicious",
     "red_flags": ["Audio metadata incomplete"],
@@ -101,13 +131,12 @@ SAFE_DEFAULT = {
 def _get_gemini_api_keys() -> List[str]:
     """
     Retrieves all configured Gemini API keys (primary & fail-safe fallbacks).
-    Checks:
-    - GEMINI_API_KEYS (comma-separated string)
-    - GEMINI_API_KEY / GEMINI_API_KEY_PRIMARY
-    - GEMINI_API_KEY_FALLBACK / GEMINI_API_KEY_SECONDARY / GEMINI_API_KEY_2 / FALLBACK_GEMINI_API_KEY
-    Returns unique non-empty keys in priority order.
+    Checks GEMINI_API_KEYS (comma-separated), GEMINI_API_KEY, GEMINI_API_KEY_FALLBACK, etc.
+
+    Returns:
+        List[str]: Unique non-empty keys in priority order.
     """
-    keys = []
+    keys: List[str] = []
     raw_list = os.environ.get("GEMINI_API_KEYS", "").strip()
     if raw_list:
         for k in raw_list.split(","):
@@ -135,18 +164,28 @@ def generate_synthesis(
     metadata_analysis: Dict[str, Any],
     ela_analysis: Dict[str, Any],
     source_trace: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    ai_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    ai_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Sends image findings to Gemini. Loops over primary and fail-safe fallback API keys if quota/rate limits occur.
+    Sends image forensic findings to Gemini LLM.
+    Loops over primary and fail-safe fallback API keys if quota/rate limits occur.
+
+    Args:
+        metadata_analysis (Dict[str, Any]): EXIF metadata analysis dict.
+        ela_analysis (Dict[str, Any]): Error Level Analysis dict.
+        source_trace (Dict[str, Any]): Reverse source search index dict.
+        filename_analysis (Optional[Dict[str, Any]]): Filename pattern analysis dict.
+        ai_detector (Optional[Dict[str, Any]]): Hugging Face AI detector dict.
+
+    Returns:
+        Dict[str, Any]: Synthesized report with trust_score, verdict, explanation, red_flags, limitations.
     """
     fn_analysis = filename_analysis or {
         "filename": "unknown",
         "pattern_type": "unrecognized",
         "note": "Filename pattern unrecognized"
     }
-
     ai_det = ai_detector or {"ai_generation_confidence": None, "note": "AI detector unavailable"}
 
     findings_payload = {
@@ -160,13 +199,11 @@ def generate_synthesis(
         "ai_detector": ai_det
     }
 
-    print(f"\n================ FULL GEMINI IMAGE INPUT PAYLOAD ================")
-    print(json.dumps(findings_payload, indent=2))
-    print(f"=================================================================\n")
+    logger.info(f"Generating Gemini image synthesis for payload: {json.dumps(findings_payload)}")
 
     api_keys = _get_gemini_api_keys()
     if not api_keys:
-        print("[Gemini Image Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
+        logger.info("[Gemini Image Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
         return _build_fallback(metadata_analysis, ela_analysis, source_trace, fn_analysis, ai_det)
 
     for key_idx, api_key in enumerate(api_keys):
@@ -180,12 +217,12 @@ def generate_synthesis(
             )
 
             generation_config = {
-                "temperature": 0.2,
+                "temperature": GEMINI_TEMPERATURE,
                 "response_mime_type": "application/json"
             }
 
             model = None
-            for model_name in ["gemini-3.6-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]:
+            for model_name in GEMINI_MODELS:
                 try:
                     model = genai.GenerativeModel(
                         model_name=model_name,
@@ -203,7 +240,7 @@ def generate_synthesis(
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_call_gemini)
-                response = future.result(timeout=15.0)
+                response = future.result(timeout=GEMINI_TIMEOUT_SECONDS)
 
             if response and response.text:
                 text = response.text.strip()
@@ -216,7 +253,7 @@ def generate_synthesis(
                 parsed = json.loads(text)
                 if isinstance(parsed, dict) and "trust_score" in parsed and "verdict" in parsed:
                     if key_idx > 0:
-                        print(f"[Gemini Image Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
+                        logger.info(f"[Gemini Image Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
                     return {
                         "trust_score": int(parsed.get("trust_score", 70)),
                         "verdict": str(parsed.get("verdict", "Suspicious")),
@@ -225,9 +262,9 @@ def generate_synthesis(
                         "limitations": str(parsed.get("limitations", SAFE_DEFAULT["limitations"]))
                     }
         except Exception as err:
-            print(f"[Gemini Image Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
+            logger.warning(f"[Gemini Image Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
             if key_idx < len(api_keys) - 1:
-                print(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
+                logger.info(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
                 continue
 
     return _build_fallback(metadata_analysis, ela_analysis, source_trace, fn_analysis, ai_det)
@@ -237,20 +274,28 @@ def generate_video_synthesis(
     metadata_analysis: Dict[str, Any],
     ela_analysis: Dict[str, Any],
     source_trace: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    ai_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    ai_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Sends video findings to Gemini using SYSTEM_INSTRUCTION_VIDEO.
+    Sends video forensic findings to Gemini LLM using SYSTEM_INSTRUCTION_VIDEO.
     Loops over primary and fail-safe fallback API keys if quota/rate limits occur.
-    Returns schema with malicious_percentage (no trust_score or verdict).
+
+    Args:
+        metadata_analysis (Dict[str, Any]): EXIF metadata analysis dict.
+        ela_analysis (Dict[str, Any]): Error Level Analysis dict.
+        source_trace (Dict[str, Any]): Reverse source search index dict.
+        filename_analysis (Optional[Dict[str, Any]]): Filename pattern analysis dict.
+        ai_detector (Optional[Dict[str, Any]]): Hugging Face AI keyframe detector dict.
+
+    Returns:
+        Dict[str, Any]: Synthesized video report with malicious_percentage, explanation, red_flags, limitations.
     """
     fn_analysis = filename_analysis or {
         "filename": "unknown",
         "pattern_type": "unrecognized",
         "note": "Filename pattern unrecognized"
     }
-
     ai_det = ai_detector or {"ai_generation_confidence": None, "note": "AI detector unavailable"}
 
     findings_payload = {
@@ -264,13 +309,11 @@ def generate_video_synthesis(
         "ai_detector": ai_det
     }
 
-    print(f"\n================ FULL GEMINI VIDEO INPUT PAYLOAD ================")
-    print(json.dumps(findings_payload, indent=2))
-    print(f"=================================================================\n")
+    logger.info(f"Generating Gemini video synthesis for payload: {json.dumps(findings_payload)}")
 
     api_keys = _get_gemini_api_keys()
     if not api_keys:
-        print("[Gemini Video Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
+        logger.info("[Gemini Video Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
         return _build_video_fallback(metadata_analysis, ela_analysis, source_trace, fn_analysis, ai_det)
 
     for key_idx, api_key in enumerate(api_keys):
@@ -284,12 +327,12 @@ def generate_video_synthesis(
             )
 
             generation_config = {
-                "temperature": 0.2,
+                "temperature": GEMINI_TEMPERATURE,
                 "response_mime_type": "application/json"
             }
 
             model = None
-            for model_name in ["gemini-3.6-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]:
+            for model_name in GEMINI_MODELS:
                 try:
                     model = genai.GenerativeModel(
                         model_name=model_name,
@@ -307,7 +350,7 @@ def generate_video_synthesis(
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_call_gemini)
-                response = future.result(timeout=15.0)
+                response = future.result(timeout=GEMINI_TIMEOUT_SECONDS)
 
             if response and response.text:
                 text = response.text.strip()
@@ -320,7 +363,7 @@ def generate_video_synthesis(
                 parsed = json.loads(text)
                 if isinstance(parsed, dict) and "malicious_percentage" in parsed:
                     if key_idx > 0:
-                        print(f"[Gemini Video Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
+                        logger.info(f"[Gemini Video Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
                     return {
                         "malicious_percentage": int(parsed.get("malicious_percentage", 30)),
                         "red_flags": parsed.get("red_flags", []),
@@ -328,9 +371,9 @@ def generate_video_synthesis(
                         "limitations": str(parsed.get("limitations", ""))
                     }
         except Exception as err:
-            print(f"[Gemini Video Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
+            logger.warning(f"[Gemini Video Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
             if key_idx < len(api_keys) - 1:
-                print(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
+                logger.info(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
                 continue
 
     return _build_video_fallback(metadata_analysis, ela_analysis, source_trace, fn_analysis, ai_det)
@@ -338,11 +381,20 @@ def generate_video_synthesis(
 
 def generate_audio_synthesis(
     audio_analysis: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    deepfake_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    deepfake_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Sends audio spectral findings to Gemini. Loops over primary and fail-safe fallback API keys if quota/rate limits occur.
+    Sends audio spectral findings to Gemini LLM using SYSTEM_INSTRUCTION_AUDIO.
+    Loops over primary and fail-safe fallback API keys if quota/rate limits occur.
+
+    Args:
+        audio_analysis (Dict[str, Any]): Librosa audio prosody metrics dict.
+        filename_analysis (Optional[Dict[str, Any]]): Filename pattern analysis dict.
+        deepfake_detector (Optional[Dict[str, Any]]): Deepfake audio detector dict.
+
+    Returns:
+        Dict[str, Any]: Synthesized audio report with trust_score, verdict, explanation, red_flags, limitations.
     """
     suspicious_flags = audio_analysis.get("suspicious_flags", [])
     fn_analysis = filename_analysis or {
@@ -358,13 +410,11 @@ def generate_audio_synthesis(
         "deepfake_detector": df_detector
     }
 
-    print(f"\n================ FULL GEMINI AUDIO INPUT PAYLOAD ================")
-    print(json.dumps(audio_payload, indent=2))
-    print(f"=================================================================\n")
+    logger.info(f"Generating Gemini audio synthesis for payload: {json.dumps(audio_payload)}")
 
     api_keys = _get_gemini_api_keys()
     if not api_keys:
-        print("[Gemini Audio Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
+        logger.info("[Gemini Audio Synthesis] No GEMINI_API_KEY configured — using offline fallback synthesis.")
         return _build_audio_fallback(audio_analysis, fn_analysis, df_detector)
 
     for key_idx, api_key in enumerate(api_keys):
@@ -378,12 +428,12 @@ def generate_audio_synthesis(
             )
 
             generation_config = {
-                "temperature": 0.2,
+                "temperature": GEMINI_TEMPERATURE,
                 "response_mime_type": "application/json"
             }
 
             model = None
-            for model_name in ["gemini-3.6-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]:
+            for model_name in GEMINI_MODELS:
                 try:
                     model = genai.GenerativeModel(
                         model_name=model_name,
@@ -401,7 +451,7 @@ def generate_audio_synthesis(
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(_call_gemini)
-                response = future.result(timeout=15.0)
+                response = future.result(timeout=GEMINI_TIMEOUT_SECONDS)
 
             if response and response.text:
                 text = response.text.strip()
@@ -414,7 +464,7 @@ def generate_audio_synthesis(
                 parsed = json.loads(text)
                 if isinstance(parsed, dict) and "trust_score" in parsed and "verdict" in parsed:
                     if key_idx > 0:
-                        print(f"[Gemini Audio Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
+                        logger.info(f"[Gemini Audio Synthesis] SUCCESS using fail-safe API key index #{key_idx + 1}")
                     return {
                         "trust_score": int(parsed.get("trust_score", 70)),
                         "verdict": str(parsed.get("verdict", "Suspicious")),
@@ -423,9 +473,9 @@ def generate_audio_synthesis(
                         "limitations": str(parsed.get("limitations", ""))
                     }
         except Exception as err:
-            print(f"[Gemini Audio Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
+            logger.warning(f"[Gemini Audio Synthesis] Key #{key_idx + 1} call failed / rate limited: {err}")
             if key_idx < len(api_keys) - 1:
-                print(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
+                logger.info(f"--> Retrying with fail-safe fallback Gemini API key #{key_idx + 2}...")
                 continue
 
     return _build_audio_fallback(audio_analysis, fn_analysis, df_detector)
@@ -435,9 +485,10 @@ def _build_fallback(
     metadata: Dict[str, Any],
     ela: Dict[str, Any],
     source: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    ai_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    ai_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """Deterministic offline fallback synthesis engine for images."""
     score = 100
     has_exif = metadata.get("has_exif", False)
     software_tag = str(metadata.get("software_tag") or "").lower()
@@ -448,38 +499,38 @@ def _build_fallback(
     has_strong_signal = False
 
     if not has_exif:
-        score -= 15
+        score -= EXIF_MISSING_PENALTY
 
     ai_softwares = ["midjourney", "dalle", "stable diffusion", "firefly", "gemini", "ideogram", "leonardo", "playground"]
     if any(sw in software_tag for sw in ai_softwares):
-        score -= 40
+        score -= AI_SOFTWARE_PENALTY
         has_strong_signal = True
 
     if fn_type == "ai_generator":
-        score -= 20
+        score -= AI_FILENAME_PENALTY
         has_strong_signal = True
         suspicious_flags.append(f"Filename pattern indicates AI generator output ({filename_analysis.get('filename')})")
     elif fn_type == "camera_native":
-        score += 10
+        score += CAMERA_NATIVE_BONUS
 
     ela_score = ela.get("score", 0)
-    if ela_score > 80:
-        score -= 40
-    elif ela_score > 60:
-        score -= 25
+    if ela_score > ELA_EXTREME_VAR_THRESHOLD:
+        score -= ELA_EXTREME_VAR_PENALTY
+    elif ela_score > ELA_HIGH_VAR_THRESHOLD:
+        score -= ELA_HIGH_VAR_PENALTY
 
     found_matches = source.get("found_matches", False)
     if not found_matches:
-        score -= 5
+        score -= NO_REVERSE_SEARCH_PENALTY
 
     frames_flagged = (ai_detector or {}).get("frames_flagged_ai", 0)
     per_frame = (ai_detector or {}).get("per_frame_confidence", [])
 
     if ai_confidence is not None:
         is_video = bool(per_frame)
-        if ai_confidence > 90:
-            score -= 50
-            score = min(score, 15)
+        if ai_confidence > AI_DETECTOR_EXTREME_CONF_THRESHOLD:
+            score -= AI_DETECTOR_PENALTY
+            score = min(score, AI_DETECTOR_EXTREME_MAX_TRUST_SCORE)
             has_strong_signal = True
             if is_video:
                 suspicious_flags.append(
@@ -488,8 +539,8 @@ def _build_fallback(
                 )
             else:
                 suspicious_flags.append(f"AI image detector confidence: {ai_confidence:.1f}% (very high — strong AI generation signal)")
-        elif ai_confidence > 70:
-            score -= 50
+        elif ai_confidence > AI_DETECTOR_HIGH_CONF_THRESHOLD:
+            score -= AI_DETECTOR_PENALTY
             has_strong_signal = True
             if is_video:
                 suspicious_flags.append(
@@ -534,21 +585,19 @@ def _build_video_fallback(
     metadata: Dict[str, Any],
     ela: Dict[str, Any],
     source: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    ai_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    ai_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """
-    Offline fallback for video — calculates malicious_percentage (0-100, inverted from trust_score).
-    """
+    """Deterministic offline fallback synthesis engine for videos."""
     fallback_res = _build_fallback(metadata, ela, source, filename_analysis, ai_detector)
     trust_score = fallback_res.get("trust_score", 70)
     malicious_percentage = 100 - trust_score
 
     ai_confidence = (ai_detector or {}).get("ai_generation_confidence")
     if ai_confidence is not None:
-        if ai_confidence > 90:
+        if ai_confidence > AI_DETECTOR_EXTREME_CONF_THRESHOLD:
             malicious_percentage = max(malicious_percentage, 85)
-        elif ai_confidence > 70:
+        elif ai_confidence > AI_DETECTOR_HIGH_CONF_THRESHOLD:
             malicious_percentage = max(malicious_percentage, 71)
 
     limitations_text = fallback_res.get("limitations", "")
@@ -565,9 +614,10 @@ def _build_video_fallback(
 
 def _build_audio_fallback(
     audio: Dict[str, Any],
-    filename_analysis: Dict[str, Any] = None,
-    deepfake_detector: Dict[str, Any] = None
+    filename_analysis: Optional[Dict[str, Any]] = None,
+    deepfake_detector: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """Deterministic offline fallback synthesis engine for audio."""
     score = 100
     suspicious_flags = audio.get("suspicious_flags", [])[:]
     flatness = audio.get("spectral_flatness", 0.0)
@@ -585,13 +635,13 @@ def _build_audio_fallback(
         suspicious_flags.append(f"Filename pattern indicates synthetic/AI voice generator ({filename_analysis.get('filename')})")
 
     if df_confidence is not None:
-        if df_confidence > 90:
-            score -= 50
-            score = min(score, 15)
+        if df_confidence > AI_DETECTOR_EXTREME_CONF_THRESHOLD:
+            score -= AI_DETECTOR_PENALTY
+            score = min(score, AI_DETECTOR_EXTREME_MAX_TRUST_SCORE)
             has_strong_signal = True
             suspicious_flags.append(f"Deepfake audio detector confidence: {df_confidence:.1f}% (very high — strong synthetic voice signal)")
-        elif df_confidence > 70:
-            score -= 50
+        elif df_confidence > AI_DETECTOR_HIGH_CONF_THRESHOLD:
+            score -= AI_DETECTOR_PENALTY
             has_strong_signal = True
             suspicious_flags.append(f"Deepfake audio detector confidence: {df_confidence:.1f}% (above threshold — likely AI-generated voice)")
 

@@ -2,6 +2,7 @@ import os
 import io
 import hashlib
 import asyncio
+import logging
 import httpx
 from typing import Optional, List, Dict, Any, Tuple
 from PIL import Image
@@ -23,15 +24,34 @@ from backend.services.deepfake_audio_service import run_deepfake_audio_detector
 from backend.services.video_keyframe_service import run_video_ai_detector_async, run_video_ai_detector
 from backend.services.gemini_synthesis import generate_synthesis, generate_video_synthesis, generate_audio_synthesis
 
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB Max Upload Limit
-CHUNK_SIZE = 64 * 1024              # 64KB Chunk Buffer Size
+logger = logging.getLogger(__name__)
 
-# ── In-Memory Response Caching (SHA-256 Keyed, Max 100 Entries) ─────────────
+# ── Pipeline Constants ───────────────────────────────────────────────────────
+MAX_UPLOAD_SIZE_BYTES: int = 100 * 1024 * 1024  # 100MB maximum upload payload limit
+CHUNK_SIZE_BYTES: int = 64 * 1024               # 64KB chunk buffer size for streaming
+MAX_CACHE_ENTRIES: int = 100                    # Maximum entries for SHA-256 response cache
+HTTP_FETCH_TIMEOUT_SECONDS: float = 15.0        # Timeout for URL payload fetching
+
+DEFAULT_IMAGE_FILENAME: str = "upload.jpg"
+DEFAULT_AUDIO_FILENAME: str = "audio.wav"
+
+VIDEO_EXTENSIONS: set = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
+
+# ── In-Memory SHA-256 Response Caching ───────────────────────────────────────
 _RESPONSE_CACHE: Dict[str, Dict[str, Any]] = {}
-_MAX_CACHE_SIZE = 100
+
 
 def _get_cache_key(data_bytes: bytes, target_url: Optional[str] = None) -> str:
-    """Computes a SHA-256 hex digest key for caching response payloads."""
+    """
+    Computes a deterministic SHA-256 hex digest cache key for media payload bytes or URL.
+
+    Args:
+        data_bytes (bytes): Raw binary bytes of uploaded media file.
+        target_url (Optional[str]): Source URL if provided via JSON request.
+
+    Returns:
+        str: 64-character SHA-256 hex digest string.
+    """
     hasher = hashlib.sha256()
     if target_url:
         hasher.update(f"url:{target_url}".encode("utf-8"))
@@ -39,9 +59,16 @@ def _get_cache_key(data_bytes: bytes, target_url: Optional[str] = None) -> str:
         hasher.update(data_bytes)
     return hasher.hexdigest()
 
+
 def _cache_set(key: str, val: Dict[str, Any]) -> None:
-    """Stores result in LRU-style in-memory cache."""
-    if len(_RESPONSE_CACHE) >= _MAX_CACHE_SIZE:
+    """
+    Stores analysis response in LRU-style in-memory response cache.
+
+    Args:
+        key (str): SHA-256 hex digest cache key.
+        val (Dict[str, Any]): Complete response payload dictionary to cache.
+    """
+    if len(_RESPONSE_CACHE) >= MAX_CACHE_ENTRIES:
         first_key = next(iter(_RESPONSE_CACHE))
         _RESPONSE_CACHE.pop(first_key, None)
     _RESPONSE_CACHE[key] = val
@@ -71,12 +98,23 @@ app.mount("/static", StaticFiles(directory=static_path), name="static")
 async def _extract_payload_bytes(
     request: Request,
     file: Optional[UploadFile] = None,
-    default_filename: str = "upload.jpg"
+    default_filename: str = DEFAULT_IMAGE_FILENAME
 ) -> Tuple[bytes, str, Optional[str]]:
     """
-    Explicitly checks request Content-Type to branch payload parsing into distinct handlers:
+    Explicitly checks request Content-Type header to route payload parsing:
     1. Content-Type 'application/json': parses {"url": "..."}, downloads media bytes server-side using httpx.
-    2. Content-Type 'multipart/form-data': streams uploaded file bytes in 64KB chunks up to MAX_UPLOAD_SIZE.
+    2. Content-Type 'multipart/form-data': streams uploaded file bytes in 64KB chunks up to MAX_UPLOAD_SIZE_BYTES.
+
+    Args:
+        request (Request): Incoming FastAPI HTTP request object.
+        file (Optional[UploadFile]): Uploaded file from multipart form data.
+        default_filename (str): Default filename fallback if unprovided.
+
+    Returns:
+        Tuple[bytes, str, Optional[str]]: (raw_bytes, filename, target_url)
+
+    Raises:
+        HTTPException: HTTP 400 for bad payloads or HTTP 413 if upload exceeds size limit.
     """
     content_type = request.headers.get("content-type", "").lower()
 
@@ -85,6 +123,7 @@ async def _extract_payload_bytes(
         try:
             body = await request.json()
         except Exception as err:
+            logger.warning(f"Failed to parse JSON request body: {err}")
             raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {err}")
 
         if not isinstance(body, dict) or "url" not in body or not str(body.get("url", "")).strip():
@@ -97,18 +136,22 @@ async def _extract_payload_bytes(
             filename = path_basename
 
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=HTTP_FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
                 resp = await client.get(target_url)
                 if resp.status_code != 200:
                     raise HTTPException(status_code=400, detail=f"Failed to fetch media from URL (HTTP {resp.status_code})")
                 if not resp.content:
                     raise HTTPException(status_code=400, detail="Downloaded media content from URL is empty")
-                if len(resp.content) > MAX_UPLOAD_SIZE:
-                    raise HTTPException(status_code=413, detail=f"Downloaded media exceeds max upload size ({MAX_UPLOAD_SIZE / (1024*1024)}MB)")
+                if len(resp.content) > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Downloaded media exceeds max upload size limit ({MAX_UPLOAD_SIZE_BYTES // (1024*1024)}MB)"
+                    )
                 return resp.content, filename, target_url
         except HTTPException:
             raise
         except Exception as fetch_err:
+            logger.error(f"Failed to download media from URL '{target_url}': {fetch_err}")
             raise HTTPException(status_code=400, detail=f"Failed to download media from URL: {fetch_err}")
 
     # Handler 2: Multipart form-data file upload (Streamed in 64KB chunks)
@@ -118,12 +161,12 @@ async def _extract_payload_bytes(
             byte_buf = bytearray()
             total_read = 0
 
-            while chunk := await file.read(CHUNK_SIZE):
+            while chunk := await file.read(CHUNK_SIZE_BYTES):
                 total_read += len(chunk)
-                if total_read > MAX_UPLOAD_SIZE:
+                if total_read > MAX_UPLOAD_SIZE_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_SIZE // (1024*1024)}MB"
+                        detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_SIZE_BYTES // (1024*1024)}MB"
                     )
                 byte_buf.extend(chunk)
 
@@ -141,12 +184,13 @@ async def _extract_payload_bytes(
                 content = await file_obj.read()
                 if not content:
                     raise HTTPException(status_code=400, detail="Uploaded file is empty")
-                if len(content) > MAX_UPLOAD_SIZE:
+                if len(content) > MAX_UPLOAD_SIZE_BYTES:
                     raise HTTPException(status_code=413, detail="Uploaded file exceeds max upload size limit")
                 return content, fn, None
         except HTTPException:
             raise
         except Exception as form_err:
+            logger.error(f"Failed to parse multipart form data: {form_err}")
             raise HTTPException(status_code=400, detail=f"Failed to parse multipart form data: {form_err}")
 
         raise HTTPException(status_code=400, detail="No file found in multipart/form-data upload")
@@ -159,7 +203,8 @@ async def _extract_payload_bytes(
 
 
 @app.get("/")
-def root():
+def root() -> Dict[str, Any]:
+    """Health check root endpoint returning API status and active cache count."""
     return {"status": "ok", "service": "TrustLens API Server", "cached_entries": len(_RESPONSE_CACHE)}
 
 
@@ -167,25 +212,25 @@ def root():
 async def analyze(
     request: Request,
     file: Optional[UploadFile] = File(None)
-):
+) -> Dict[str, Any]:
     """
-    Accepts image/video uploads or URLs.
+    Main verification pipeline endpoint for image and video analysis.
+    Accepts multipart/form-data upload or JSON {"url": "..."}.
     Checks SHA-256 payload cache first for 0ms instant response on repeat files.
-    Decodes PIL Image once into RAM and offloads CPU tasks to threads.
+    Decodes PIL Image instance once in RAM and offloads CPU tasks to worker thread pool.
     """
-    raw_bytes, filename, target_url = await _extract_payload_bytes(request, file=file, default_filename="upload.jpg")
+    raw_bytes, filename, target_url = await _extract_payload_bytes(request, file=file, default_filename=DEFAULT_IMAGE_FILENAME)
 
     # Check Response Cache (0ms Instant Hit)
     cache_key = _get_cache_key(raw_bytes, target_url=target_url)
     if cache_key in _RESPONSE_CACHE:
-        print(f"[TrustLens Cache] Cache HIT for SHA-256 key {cache_key[:12]}... (0ms instant return)")
+        logger.info(f"[TrustLens Cache] Cache HIT for SHA-256 key {cache_key[:12]}... (0ms instant return)")
         return _RESPONSE_CACHE[cache_key]
 
-    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv"}
     file_ext = os.path.splitext(filename)[1].lower()
-    is_video = file_ext in video_exts or "video" in request.url.path
+    is_video = file_ext in VIDEO_EXTENSIONS or "video" in request.url.path
 
-    # In-memory Image Pre-decoding (Decode once, share across metadata & ELA)
+    # In-memory Image Pre-decoding (Decode once into RAM, share across metadata & ELA)
     pre_decoded_pil: Optional[Image.Image] = None
     if not is_video:
         try:
@@ -209,7 +254,7 @@ async def analyze(
         if isinstance(extracted, dict):
             metadata_analysis = extracted
     except Exception as meta_err:
-        print("Metadata signal computation error:", meta_err)
+        logger.error(f"Metadata signal computation error: {meta_err}")
 
     # Signal 2: Error Level Analysis (ELA) (CPU offloaded, pre-decoded image passed)
     base_url = str(request.base_url).rstrip("/")
@@ -229,7 +274,7 @@ async def analyze(
                 "original_image_url": ela_res.get("original_image_url", None)
             }
     except Exception as ela_err:
-        print("ELA signal computation error:", ela_err)
+        logger.error(f"ELA signal computation error: {ela_err}")
 
     # Signal 3: Source Trace Analysis
     source_trace = {"found_matches": False, "note": "reverse search unavailable"}
@@ -238,7 +283,7 @@ async def analyze(
         if isinstance(source_res, dict):
             source_trace = source_res
     except Exception as source_err:
-        print("Source trace signal computation error:", source_err)
+        logger.error(f"Source trace signal computation error: {source_err}")
 
     # Signal 4: HuggingFace AI Detector (IO Async / Concurrent Keyframes for Video)
     ai_detector = {"ai_generation_confidence": None, "note": "AI detector unavailable"}
@@ -250,7 +295,7 @@ async def analyze(
         if isinstance(ai_res, dict):
             ai_detector = ai_res
     except Exception as ai_err:
-        print("AI detector signal computation error:", ai_err)
+        logger.error(f"AI detector signal computation error: {ai_err}")
 
     # Signal 5: Gemini LLM Synthesis
     if is_video:
@@ -267,7 +312,7 @@ async def analyze(
             if isinstance(syn_res, dict) and "malicious_percentage" in syn_res:
                 synthesis = syn_res
         except Exception as gemini_err:
-            print("Gemini video synthesis computation error:", gemini_err)
+            logger.error(f"Gemini video synthesis computation error: {gemini_err}")
 
         response_payload = {
             "malicious_percentage": synthesis.get("malicious_percentage", 30),
@@ -297,7 +342,7 @@ async def analyze(
             if isinstance(syn_res, dict) and "trust_score" in syn_res:
                 synthesis = syn_res
         except Exception as gemini_err:
-            print("Gemini synthesis computation error:", gemini_err)
+            logger.error(f"Gemini synthesis computation error: {gemini_err}")
 
         response_payload = {
             "trust_score": synthesis.get("trust_score", 70),
@@ -323,7 +368,7 @@ async def analyze(
 async def analyze_video(
     request: Request,
     file: Optional[UploadFile] = File(None)
-):
+) -> Dict[str, Any]:
     """
     Dedicated endpoint for video analysis — delegates to main analyze logic with video forced.
     """
@@ -334,18 +379,18 @@ async def analyze_video(
 async def analyze_audio(
     request: Request,
     file: Optional[UploadFile] = File(None)
-):
+) -> Dict[str, Any]:
     """
     Accepts audio uploads or URLs.
     Checks SHA-256 cache first for 0ms instant return.
     Streams upload bytes and offloads CPU prosody calculation to thread pool.
     """
-    audio_bytes, filename, target_url = await _extract_payload_bytes(request, file=file, default_filename="audio.wav")
+    audio_bytes, filename, target_url = await _extract_payload_bytes(request, file=file, default_filename=DEFAULT_AUDIO_FILENAME)
 
     # Check Response Cache (0ms Instant Hit)
     cache_key = _get_cache_key(audio_bytes, target_url=target_url)
     if cache_key in _RESPONSE_CACHE:
-        print(f"[TrustLens Cache] Cache HIT for SHA-256 audio key {cache_key[:12]}...")
+        logger.info(f"[TrustLens Cache] Cache HIT for SHA-256 audio key {cache_key[:12]}...")
         return _RESPONSE_CACHE[cache_key]
 
     # Signal 0: Filename Pattern Analysis
@@ -363,7 +408,7 @@ async def analyze_audio(
         if isinstance(extracted_audio, dict):
             audio_analysis = extracted_audio
     except Exception as audio_err:
-        print("Audio analysis signal computation error:", audio_err)
+        logger.error(f"Audio analysis signal computation error: {audio_err}")
 
     # Signal 2: HuggingFace Deepfake Audio Detector
     deepfake_detector = {"deepfake_audio_confidence": None, "note": "Deepfake audio detector unavailable"}
@@ -372,7 +417,7 @@ async def analyze_audio(
         if isinstance(df_res, dict):
             deepfake_detector = df_res
     except Exception as df_err:
-        print("Deepfake audio detector signal computation error:", df_err)
+        logger.error(f"Deepfake audio detector signal computation error: {df_err}")
 
     # Signal 3: Gemini Audio Synthesis
     synthesis = {
@@ -389,7 +434,7 @@ async def analyze_audio(
         if isinstance(syn_res, dict) and "trust_score" in syn_res:
             synthesis = syn_res
     except Exception as gemini_audio_err:
-        print("Gemini audio synthesis error:", gemini_audio_err)
+        logger.error(f"Gemini audio synthesis error: {gemini_audio_err}")
 
     response_payload = {
         "trust_score": synthesis.get("trust_score", 70),

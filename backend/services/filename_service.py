@@ -1,7 +1,11 @@
 import os
 import re
+import logging
 from typing import Dict, Any
 
+logger = logging.getLogger(__name__)
+
+# ── Service Constants & Regex Patterns ───────────────────────────────────────
 AI_WORDS_RE = re.compile(
     r"(\bai\b|generated|sora|runway|pika|kling|veo|synthesia|heygen|deepfake|midjourney|dalle|dall-e|stable[_-]?diffusion|sdxl|gemini|leonardo|output|flux|chatgpt|ideogram|playground)",
     re.IGNORECASE
@@ -22,16 +26,20 @@ GENERIC_DOWNLOAD_RE = re.compile(
     re.IGNORECASE
 )
 
+
 def analyze_filename(filename: str) -> Dict[str, Any]:
     """
     Analyzes an uploaded file's original filename for AI generator, camera native, or generic download patterns.
+
+    Args:
+        filename (str): Original filename of uploaded media.
+
     Returns:
-      {
-        "filename": str,
-        "pattern_type": "ai_generator" | "camera_native" | "generic_download" | "unrecognized",
-        "note": str
-      }
-    Never crashes on missing, empty, or unusual filenames — defaults safely to unrecognized.
+        Dict[str, Any]: {
+            "filename": str,
+            "pattern_type": "ai_generator" | "camera_native" | "generic_download" | "unrecognized",
+            "note": str
+        }
     """
     try:
         clean_name = os.path.basename(str(filename or "")).strip()
@@ -74,10 +82,9 @@ def analyze_filename(filename: str) -> Dict[str, Any]:
             "note": "Custom or unclassified filename pattern"
         }
     except Exception as err:
-        print("Filename analysis error:", err)
+        logger.error(f"Filename analysis error: {err}")
         return {
             "filename": str(filename or "unknown"),
             "pattern_type": "unrecognized",
             "note": "Filename pattern unrecognized"
         }
-

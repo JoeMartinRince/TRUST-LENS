@@ -1,7 +1,14 @@
 import os
+import logging
 import httpx
 import urllib.parse
 from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Service Constants ────────────────────────────────────────────────────────
+REVERSE_SEARCH_TIMEOUT_SECONDS: float = 10.0
+
 
 def trace_source(
     url: Optional[str] = None, 
@@ -12,7 +19,14 @@ def trace_source(
     Performs reverse image search using SerpAPI or Google Custom Search JSON API if API keys are configured.
     If no API key is configured or if the request fails, gracefully degrades to:
       {"found_matches": False, "note": "reverse search unavailable"}
-    Never crashes.
+
+    Args:
+        url (Optional[str]): Source URL of media.
+        image_bytes (Optional[bytes]): Raw image bytes.
+        metadata (Optional[Dict[str, Any]]): Extracted metadata dictionary.
+
+    Returns:
+        Dict[str, Any]: Reverse search trace dictionary with earliest_source or note.
     """
     serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
     google_search_key = os.environ.get("GOOGLE_SEARCH_API_KEY", "").strip()
@@ -26,7 +40,7 @@ def trace_source(
                 "image_url": url,
                 "api_key": serpapi_key
             }
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=REVERSE_SEARCH_TIMEOUT_SECONDS) as client:
                 resp = client.get("https://serpapi.com/search", params=params)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -45,7 +59,7 @@ def trace_source(
                             "total_matches": len(inline_results)
                         }
         except Exception as e:
-            print("SerpAPI reverse search request failed:", e)
+            logger.warning(f"SerpAPI reverse search request failed: {e}")
 
     # 2. Google Custom Search JSON API fallback
     if google_search_key and google_cx and url:
@@ -55,7 +69,7 @@ def trace_source(
                 "cx": google_cx,
                 "q": url
             }
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=REVERSE_SEARCH_TIMEOUT_SECONDS) as client:
                 resp = client.get("https://www.googleapis.com/customsearch/v1", params=params)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -74,7 +88,7 @@ def trace_source(
                             "total_matches": len(items)
                         }
         except Exception as e:
-            print("Google Custom Search API request failed:", e)
+            logger.warning(f"Google Custom Search API request failed: {e}")
 
     # 3. Graceful degradation when no API keys are provided or calls fail
     return {

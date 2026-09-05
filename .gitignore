@@ -20,7 +20,7 @@ venv.bak/
 .venv/
 
 # Static generated heatmaps / temp keyframes
-backend/static/ela_*.jpg
+backend/static/heatmaps/*
 backend/static/frame_*.jpg
 
 # Node / Frontend

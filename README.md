@@ -99,6 +99,22 @@ Open `http://localhost:8080` in your browser.
 
 ---
 
+## 🧪 Running Tests
+
+### Backend Tests (pytest)
+Run backend unit & endpoint tests with:
+```bash
+pytest backend/tests/
+```
+
+### Frontend Tests (Vitest + React Testing Library)
+Run frontend component tests with:
+```bash
+bun run test   # or npm run test
+```
+
+---
+
 ## 📡 API Reference
 
 ### `POST /analyze`

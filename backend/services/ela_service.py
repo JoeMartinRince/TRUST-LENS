@@ -4,6 +4,7 @@ import uuid
 import logging
 import traceback
 import numpy as np
+from typing import Union
 from PIL import Image, ImageChops, ImageEnhance
 import cv2
 
@@ -13,17 +14,18 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", 
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 def run_ela_analysis(
-    image_bytes: bytes, 
+    image_input: Union[bytes, Image.Image], 
     quality: int = 90, 
     amplify: float = 15.0,
     base_url: str = "http://localhost:8000"
 ) -> dict:
     """
     Performs Error Level Analysis (ELA):
+    Accepts either raw bytes OR a pre-decoded in-memory PIL Image object to avoid redundant image decoding.
     1. Re-saves uploaded image as JPEG at quality=90 in memory.
     2. Computes pixel-wise difference against original with PIL & numpy.
     3. Amplifies difference (~15-20x) into a visible heatmap.
-    4. Saves heatmap PNG to backend/static/heatmaps/ folder.
+    4. Saves heatmap PNG to static/heatmaps/ folder.
     5. Computes ela_score (0-100) based on error variance and intensity.
     """
     img_format = "Unknown"
@@ -31,16 +33,25 @@ def run_ela_analysis(
     img_dimensions = "Unknown"
 
     try:
-        # Attempt to inspect image properties
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as raw_img:
+        if isinstance(image_input, Image.Image):
+            original = image_input.convert("RGB")
+            img_format = str(getattr(image_input, "format", "PIL.Image"))
+        elif isinstance(image_input, bytes):
+            if not image_input:
+                return {
+                    "score": 0,
+                    "heatmap_url": None,
+                    "original_image_url": None,
+                    "explanation": "ELA computation failed: empty image bytes"
+                }
+            with Image.open(io.BytesIO(image_input)) as raw_img:
                 img_format = str(raw_img.format)
                 img_mode = str(raw_img.mode)
                 img_dimensions = f"{raw_img.size[0]}x{raw_img.size[1]}"
-        except Exception:
-            pass
+                original = raw_img.convert("RGB")
+        else:
+            raise ValueError(f"Invalid image_input type: {type(image_input)}")
 
-        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img_mode = str(original.mode)
         img_dimensions = f"{original.size[0]}x{original.size[1]}"
         
@@ -100,13 +111,11 @@ def run_ela_analysis(
         }
 
     except Exception as e:
-        header_preview = image_bytes[:16].hex() if image_bytes else "None"
         err_msg = (
             f"\n================ ELA PROCESSING EXCEPTION TRACEBACK ================\n"
             f"Image Format: {img_format}\n"
             f"Image Mode: {img_mode}\n"
             f"Image Dimensions: {img_dimensions}\n"
-            f"Input Bytes Size: {len(image_bytes) if image_bytes else 0} bytes (Header hex: {header_preview})\n"
             f"Exception Type: {type(e).__name__}\n"
             f"Exception Message: {e}\n"
             f"Full Traceback:\n{traceback.format_exc()}"

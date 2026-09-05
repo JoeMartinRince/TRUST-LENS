@@ -49,7 +49,6 @@ def test_analyze_video_endpoint_success(client):
     Test 2: /analyze-video endpoint with valid video file returns 200 and expected video schema keys:
     malicious_percentage, red_flags, explanation, limitations.
     """
-    # Create a small dummy video file payload (e.g. dummy bytes with .mp4 extension)
     dummy_video_bytes = b"ftypisom" + b"\x00" * 256
     files = {"file": ("test_video.mp4", dummy_video_bytes, "video/mp4")}
 
@@ -78,19 +77,33 @@ def test_malformed_upload_returns_error(client):
     """
     Test 4: Malformed/invalid file uploads or missing payloads return a proper 400 error response instead of crashing.
     """
-    # Case A: Unsupported Content-Type header
     headers = {"Content-Type": "text/plain"}
     response = client.post("/analyze", content=b"invalid raw data", headers=headers)
     assert response.status_code == 400
     assert "detail" in response.json()
 
-    # Case B: Empty JSON payload
     response_json = client.post("/analyze", json={})
     assert response_json.status_code == 400
     assert "detail" in response_json.json()
 
-    # Case C: Empty file upload in multipart/form-data
     empty_files = {"file": ("empty.jpg", b"", "image/jpeg")}
     response_empty = client.post("/analyze", files=empty_files)
     assert response_empty.status_code == 400
     assert "detail" in response_empty.json()
+
+
+def test_response_caching_returns_instant_cached_data(client):
+    """
+    Test 5: Submitting identical file bytes returns cached response payload instantly on repeated calls.
+    """
+    img_bytes = create_dummy_image_bytes(format="JPEG", size=(30, 30), color="blue")
+    files1 = {"file": ("cache_test.jpg", img_bytes, "image/jpeg")}
+    files2 = {"file": ("cache_test.jpg", img_bytes, "image/jpeg")}
+
+    resp1 = client.post("/analyze", files=files1)
+    assert resp1.status_code == 200
+
+    resp2 = client.post("/analyze", files=files2)
+    assert resp2.status_code == 200
+
+    assert resp1.json() == resp2.json()

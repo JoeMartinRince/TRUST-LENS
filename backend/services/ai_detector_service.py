@@ -4,6 +4,9 @@ import json
 import logging
 import httpx
 from typing import Dict, Any, Optional, List
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +157,8 @@ async def run_ai_detector_async(
         Dict[str, Any]: {"ai_generation_confidence": float|None, "model_used": str, "raw_label": str}
     """
     token = os.environ.get("HF_API_TOKEN", "").strip()
+    if not token:
+        logger.warning(f"[AI-detector-async{log_prefix}] ⚠️ HF_API_TOKEN is missing or empty in environment! HF request will be sent unauthenticated.")
 
     headers = {
         "Content-Type": "application/octet-stream",
@@ -170,7 +175,11 @@ async def run_ai_detector_async(
         for model_id in HF_MODELS:
             for base_url in HF_BASE_URLS:
                 url = f"{base_url}/{model_id}"
-                logger.info(f"[AI-detector-async{log_prefix}] POST {url} ({len(image_bytes)} bytes)")
+                logger.info(
+                    f"[AI-detector-async{log_prefix}] Outgoing HF API Request -> "
+                    f"Model Endpoint: '{url}' | Image Size: {len(image_bytes)} bytes | "
+                    f"Auth Token Present: {bool(token)}"
+                )
 
                 try:
                     response = await client.post(
@@ -178,13 +187,14 @@ async def run_ai_detector_async(
                         content=image_bytes,
                         headers=headers,
                     )
-                    logger.info(f"[AI-detector-async{log_prefix}] HTTP {response.status_code} from {model_id}")
+                    logger.info(
+                        f"[AI-detector-async{log_prefix}] Incoming HF API Response <- "
+                        f"Model Endpoint: '{url}' | HTTP Status Code: {response.status_code} | "
+                        f"Raw Response Body: {response.text}"
+                    )
 
                     if response.status_code == 200:
                         data = response.json()
-                        raw_json_str = json.dumps(data)
-                        logger.info(f"[AI-detector-async{log_prefix}] Full raw JSON response from HF API ({model_id}): {raw_json_str}")
-
                         confidence = _parse_confidence(data, log_prefix=f"{log_prefix} [{model_id}]")
                         if confidence is not None:
                             items = data[0] if data and isinstance(data[0], list) else data
@@ -200,8 +210,8 @@ async def run_ai_detector_async(
                         logger.warning(f"[AI-detector-async{log_prefix}] {model_id} loading (503): {response.text[:200]}")
                         break
 
-                    elif response.status_code == 401:
-                        logger.warning(f"[AI-detector-async{log_prefix}] HF_API_TOKEN rejected or missing (401) for {model_id}")
+                    elif response.status_code in (401, 403):
+                        logger.warning(f"[AI-detector-async{log_prefix}] HF_API_TOKEN auth/permission error ({response.status_code}) for {model_id}: {response.text[:200]}")
                         break
 
                     else:

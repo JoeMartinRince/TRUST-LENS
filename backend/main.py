@@ -95,6 +95,31 @@ os.makedirs(static_path, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 
+@app.on_event("startup")
+async def startup_check_environment() -> None:
+    """
+    Checks environment variables on app startup and logs warnings for any missing credentials.
+    """
+    hf_token = os.environ.get("HF_API_TOKEN", "").strip()
+    if not hf_token:
+        logger.warning(
+            "⚠️  [STARTUP WARNING] HF_API_TOKEN is missing or empty in environment / .env! "
+            "Hugging Face AI detector calls will fail or operate unauthenticated."
+        )
+    else:
+        logger.info("✅ [STARTUP CHECK] HF_API_TOKEN successfully loaded from environment.")
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key:
+        logger.warning(
+            "⚠️  [STARTUP WARNING] GEMINI_API_KEY is missing or empty in environment / .env! "
+            "Gemini synthesis will fall back to local heuristics."
+        )
+    else:
+        logger.info("✅ [STARTUP CHECK] GEMINI_API_KEY successfully loaded from environment.")
+
+
+
 async def _extract_payload_bytes(
     request: Request,
     file: Optional[UploadFile] = None,

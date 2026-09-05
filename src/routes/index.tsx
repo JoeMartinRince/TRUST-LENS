@@ -95,7 +95,10 @@ function Index() {
       setIsBackendReady(true);
     } catch (err: any) {
       console.error("Analysis request failed:", err);
-      setErrorMessage(err.message || "Failed to complete analysis. Please ensure backend is running.");
+      const msg = err.message === "Failed to fetch"
+        ? "Backend connection failed. Please ensure the Python FastAPI backend server is running on http://localhost:8000."
+        : (err.message || "Failed to complete analysis. Please ensure backend is running.");
+      setErrorMessage(msg);
       setAppState("upload");
     }
   };
